@@ -2,29 +2,18 @@
 
 Public-safe Next.js monolith slice for a developer take-home.
 
-Real Digital Shelf exports read private Snowflake data. This repo uses PostgreSQL fixture data instead. PostgreSQL should work locally; the intended problem is Node.js CPU/RAM pressure during export.
+This Next.js app uses 500,000 PostgreSQL fixture observations to reproduce
+memory pressure during Product Health exports. Production Digital Shelf data
+normally comes from Snowflake.
 
-## Context
+The original export loaded all results and built the CSV in memory. This change
+reads in batches, calculates incrementally and writes to temporary files before
+streaming the download.
 
-The app has:
-
-- 500k product observation records
-- SEA6 countries, Taiwan, and China
-- report filters
-- one-click CSV export based on selected filters
-- wide raw snapshot data to mimic warehouse export payloads
-- one app container with constrained CPU/RAM
-
-Read [SYSTEM_CONTEXT.md](./SYSTEM_CONTEXT.md) before writing architecture notes.
-
-Read [CANDIDATE_BRIEF.md](./CANDIDATE_BRIEF.md) for more context.
-
-## Expected Starter Behavior
-
-- Smaller filtered exports should complete.
-- Full dataset export is expected to exhaust app resources and restart the app container.
-- The first task is not to make the full export complete. It is to keep the app from fully breaking when the full export is attempted.
-- Extra credit: make full dataset export complete, or explain how you would complete it safely without building the whole solution.
+- [Architecture and tradeoffs](ARCHITECTURE.md)
+- [AI usage](AI_USAGE.md)
+- [Original assignment](CANDIDATE_BRIEF.md)
+- [System context](SYSTEM_CONTEXT.md)
 
 ## Setup
 
@@ -52,30 +41,45 @@ docker compose down -v
 docker compose up --build
 ```
 
-## Commands
+## Development and checks
+
+Use pnpm 10.26.1 as specified in `package.json`. For local dependencies:
+
+```bash
+corepack pnpm install --frozen-lockfile
+```
 
 ```bash
 docker compose exec app pnpm typecheck
-docker compose exec app pnpm build
+pnpm test
+pnpm build
 ```
 
-## Tasks
+## Export resource protection
 
-### Task 1
+The export reads a PostgreSQL cursor in batches of 1,000 rows, carries the
+unfinished product group across batches, and writes summary/raw data to temporary
+files. The completed CSV is streamed to the response and temporary files are removed.
 
-Change the implementation so a full-dataset export failure does not crash or make the whole app unusable. Smaller filtered exports should still work.
+Only one export is admitted per Node.js process, including file delivery and
+cleanup. Concurrent requests receive `429` with `Retry-After: 5`. This guard is
+process-local and would need shared coordination for multiple app processes.
 
-### Task 2
+If the client disconnects, the export stops at the next cancellation check and cleans up its resources. If the file is already being downloaded, the transfer is stopped.
 
-Write `ARCHITECTURE.md` for the whole system, using [SYSTEM_CONTEXT.md](./SYSTEM_CONTEXT.md).
+Exports have a two-minute time limit. Each database fetch can run for up to 30 seconds, or less if the export has less time remaining. A query already in progress may need to finish or time out before cleanup can begin. Waiting for a database connection and rolling back the transaction each have a separate five-second timeout.
 
-## Deliverables
+If the export times out before the download starts, the API returns `504`. If the download has already started, the connection is closed and the file may be incomplete.
 
-- working code
-- `ARCHITECTURE.md`
-- `AI_USAGE.md`
-- README notes explaining what you changed, why, and how you verified it
+Unit tests use Node's built-in test runner and TypeScript stripping (Node.js
+22.18+ or a newer supported release). Run `pnpm test`, or
+`docker compose exec app pnpm test` using the supplied Node 22 image.
+Tests call the handler directly with fake CSV/file operations; no database is needed.
 
-## AI Usage
+### Export feedback
 
-AI is allowed. Explain what you used it for and what you manually reviewed.
+The Export button stays disabled while the CSV is being prepared. Cancel export
+stops the preparation request; server cleanup may take a moment. When the file
+is ready, the browser handles the download and the page shows a handoff message.
+Use the browser Downloads panel to track or cancel the transfer after that point.
+Errors such as a busy export (`429`) are displayed on the page.

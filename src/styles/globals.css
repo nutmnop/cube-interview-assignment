@@ -173,3 +173,33 @@ td small {
     width: 100%;
   }
 }
+
+.spinner {
+  width: 16px;
+  height: 16px;
+  margin-right: 8px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner { animation: none; }
+}
+
+.exportActions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.cancelExport {
+  color: #344054;
+  background: white;
+  border: 1px solid #c9d0dc;
+}

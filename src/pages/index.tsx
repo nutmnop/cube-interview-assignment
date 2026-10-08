@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState } from 'react';
+import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import type { ProductRow, ReportFilters } from '@/lib/product-health';
 
 const initialFilters: ReportFilters = {
@@ -17,6 +17,10 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [exporting, setExporting] = useState(false);
+  const [exportMessage, setExportMessage] = useState('');
+  const [exportError, setExportError] = useState('');
+  const downloadToken = useRef<string | null>(null);
+  const downloadFrame = useRef<HTMLIFrameElement>(null);
 
   const query = useMemo(
     () => new URLSearchParams(cleanFilters(filters)).toString(),
@@ -43,12 +47,85 @@ export default function Home() {
     setLoading(false);
   }
 
-  async function requestExport() {
-    setError('');
+  function requestExport() {
+    if (downloadToken.current) return;
+    const token = crypto.randomUUID();
+    downloadToken.current = token;
+    setExportError('');
+    setExportMessage('Preparing your CSV. Large exports may take up to two minutes.');
     setExporting(true);
-    window.location.href = `/api/product-health/export?${query}`;
-    window.setTimeout(() => setExporting(false), 1500);
+    if (downloadFrame.current) {
+      downloadFrame.current.src = `/api/product-health/export?${query}&downloadToken=${token}`;
+    }
   }
+
+  function cancelExport() {
+    downloadToken.current = null;
+    if (downloadFrame.current) downloadFrame.current.src = 'about:blank';
+    setExporting(false);
+    setExportError('');
+    setExportMessage('Export preparation cancelled. The server may take a moment to finish cleanup.');
+  }
+
+  function handleDownloadResponse() {
+    if (!downloadToken.current) return;
+    const text = downloadFrame.current?.contentDocument?.body?.textContent;
+    if (!text) return;
+
+    // Attachments go to the browser; an error response loads inside the frame.
+    let message = 'Export failed. Please try again.';
+    try {
+      const body = JSON.parse(text);
+      if (typeof body.message === 'string') message = body.message;
+    } catch {
+      // Keep the fallback for an unexpected server response.
+    }
+    downloadToken.current = null;
+    setExporting(false);
+    setExportMessage('');
+    setExportError(message);
+  }
+
+  useEffect(() => {
+    if (!exporting) return;
+    const checkReady = window.setInterval(() => {
+      const token = downloadToken.current;
+      if (!token) return;
+      const cookies = document.cookie.split('; ');
+      const failure = cookies.find(cookie => cookie.startsWith(`exportError=${token}-`));
+      if (failure) {
+        const status = failure.slice(failure.lastIndexOf('-') + 1);
+        document.cookie = 'exportError=; Path=/; Max-Age=0; SameSite=Strict';
+        downloadToken.current = null;
+        setExporting(false);
+        setExportMessage('');
+        setExportError(status === '429'
+          ? 'Another export is running. Please wait a few seconds and try again.'
+          : status === '504'
+            ? 'Export timed out. Please use narrower filters.'
+            : 'Export failed. Please try again.');
+        return;
+      }
+      const ready = cookies.includes(`exportReady=${token}`);
+      if (ready) {
+        document.cookie = 'exportReady=; Path=/; Max-Age=0; SameSite=Strict';
+        downloadToken.current = null;
+        setExporting(false);
+        setExportMessage('Your file is ready. Check your browser downloads for progress.');
+      }
+    }, 250);
+    const timeout = window.setTimeout(() => {
+      if (!downloadToken.current) return;
+      downloadToken.current = null;
+      setExporting(false);
+      setExportMessage('');
+      setExportError('We could not confirm the download. Check your browser downloads before retrying.');
+    }, 135000);
+    return () => {
+      window.clearInterval(checkReady);
+      window.clearTimeout(timeout);
+    };
+  }, [exporting]);
 
   function submit(event: FormEvent) {
     event.preventDefault();
@@ -66,10 +143,25 @@ export default function Home() {
           <p className="eyebrow">Digital Shelf</p>
           <h1>Product Health</h1>
         </div>
-        <button onClick={requestExport} disabled={exporting}>
-          {exporting ? 'Preparing...' : 'Export Selected Filters'}
-        </button>
+        <div className="exportActions">
+          <button onClick={requestExport} disabled={exporting} aria-busy={exporting}>
+            {exporting && <span className="spinner" aria-hidden="true" />}
+            {exporting ? 'Preparing CSV...' : 'Export Selected Filters'}
+          </button>
+          {exporting && (
+            <button className="cancelExport" onClick={cancelExport}>Cancel export</button>
+          )}
+        </div>
       </section>
+
+      <iframe
+        ref={downloadFrame}
+        title="CSV download"
+        hidden
+        onLoad={handleDownloadResponse}
+      />
+      {exportMessage && <section className="status" role="status">{exportMessage}</section>}
+      {exportError && <section className="error" role="alert">{exportError}</section>}
 
       <form className="filters" onSubmit={submit}>
         {/* <label>

@@ -6,4 +6,4 @@ if (!connectionString) {
   throw new Error('DATABASE_URL is required');
 }
 
-export const pool = new Pool({ connectionString });
+export const pool = new Pool({ connectionString, connectionTimeoutMillis: 5000 });

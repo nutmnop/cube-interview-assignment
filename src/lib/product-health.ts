@@ -1,3 +1,7 @@
+import { createReadStream } from 'node:fs';
+import { mkdtemp, open, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { pool } from './db';
 import { toCsv, type CsvRow } from './csv';
 
@@ -179,12 +183,91 @@ export async function getReport(filters: ReportFilters): Promise<ReportResult> {
   };
 }
 
-export async function exportCalculatedCsv(filters: ReportFilters): Promise<{
+export async function exportCalculatedCsv(
+  filters: ReportFilters,
+  signal?: AbortSignal,
+  deadline = Date.now() + 120000
+): Promise<{
   fileName: string;
-  content: string;
+  filePath: string;
+  cleanup: () => Promise<void>;
 }> {
-  const rows = await getRawObservations(filters);
-  const rawRows = rows.map((row) => ({
+  signal?.throwIfAborted();
+  const directory = await mkdtemp(join(tmpdir(), 'product-health-'));
+  const filePath = join(directory, 'report.csv');
+  const rawPath = join(directory, 'raw.csv');
+  const cleanup = () => rm(directory, { recursive: true, force: true });
+
+  try {
+    const summaryFile = await open(filePath, 'w');
+    try {
+      const rawFile = await open(rawPath, 'w');
+      try {
+        let current: ProductAccumulator | undefined;
+        let hasSummary = false;
+        let hasRaw = false;
+
+        for await (const batch of getRawObservations(filters, signal, deadline)) {
+          signal?.throwIfAborted();
+          const completed: ProductRow[] = [];
+          for (const row of batch) {
+            if (
+              current &&
+              (current.skuId !== row.skuId || current.channel !== row.channel)
+            ) {
+              completed.push(finalizeProductHealth(current));
+              current = undefined;
+            }
+            current = accumulateProductHealth(current, row);
+          }
+
+          signal?.throwIfAborted();
+          // Write only completed groups. The last group continues in the next batch.
+          if (completed.length > 0) {
+            await summaryFile.appendFile(toCsv(completed as CsvRow[], !hasSummary));
+            hasSummary = true;
+          }
+
+          const rawRows = batch.map(toRawCsvRow);
+          signal?.throwIfAborted();
+          await rawFile.appendFile(toCsv(rawRows, !hasRaw));
+          hasRaw = true;
+        }
+
+        signal?.throwIfAborted();
+        if (current) {
+          await summaryFile.appendFile(
+            toCsv([finalizeProductHealth(current)] as CsvRow[], !hasSummary)
+          );
+        }
+      } finally {
+        await rawFile.close();
+      }
+
+      // Preserve the original format: summary first, raw observations second.
+      await summaryFile.appendFile('\n\n# Raw observations\n');
+      for await (const chunk of createReadStream(rawPath)) {
+        signal?.throwIfAborted();
+        await summaryFile.appendFile(chunk);
+      }
+    } finally {
+      await summaryFile.close();
+    }
+
+    signal?.throwIfAborted();
+    return {
+      fileName: `product-health-calculated-${filters.startDate}-to-${filters.endDate}.csv`,
+      filePath,
+      cleanup,
+    };
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
+}
+
+function toRawCsvRow(row: Observation): CsvRow {
+  return {
     productName: row.productName,
     skuId: row.skuId,
     country: row.country,
@@ -202,20 +285,14 @@ export async function exportCalculatedCsv(filters: ReportFilters): Promise<{
     contentScore: row.contentScore,
     rawSnapshot: row.rawSnapshot,
     diagnosticPayload: `${row.rawSnapshot};calculation_context=${row.skuId}:${row.channel}:${row.price}:${row.rating}`,
-  }));
-  const report = calculateProductHealth(rows);
-  const summaryCsv = toCsv(report as CsvRow[]);
-  const rawCsv = toCsv(rawRows as CsvRow[]);
-
-  return {
-    fileName: `product-health-calculated-${filters.startDate}-to-${filters.endDate}.csv`,
-    content: `${summaryCsv}\n\n# Raw observations\n${rawCsv}`,
   };
 }
 
-async function getRawObservations(
-  filters: ReportFilters
-): Promise<Observation[]> {
+async function* getRawObservations(
+  filters: ReportFilters,
+  signal?: AbortSignal,
+  deadline = Date.now() + 120000
+): AsyncGenerator<Observation[], void, unknown> {
   const where = buildWhere(filters);
   const query = `
     SELECT
@@ -240,72 +317,106 @@ async function getRawObservations(
     ORDER BY sku_id, channel, observed_at
   `;
 
-  const result = await pool.query<Observation>(query, where.values);
-  return result.rows;
+  signal?.throwIfAborted();
+  const client = await pool.connect();
+  try {
+    signal?.throwIfAborted();
+    await client.query('BEGIN READ ONLY');
+    await client.query("SET LOCAL statement_timeout = '30s'");
+    await client.query(
+      `DECLARE export_cursor NO SCROLL CURSOR FOR ${query}`,
+      where.values
+    );
+
+    while (true) {
+      signal?.throwIfAborted();
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error('Export timed out');
+      // Bound in-flight FETCH work; abort checks run again when it returns.
+      await client.query("SELECT set_config('statement_timeout', $1, true)", [
+        String(Math.max(1, Math.min(30000, remaining))),
+      ]);
+      const { rows } = await client.query<Observation>(
+        'FETCH FORWARD 1000 FROM export_cursor'
+      );
+      signal?.throwIfAborted();
+      if (rows.length === 0) break;
+      yield rows;
+    }
+  } catch (error) {
+    console.error('Error fetching raw observations:', error);
+    throw error;
+  } finally {
+    let discard = false;
+    try {
+      const rollback = { text: 'ROLLBACK', query_timeout: 5000 };
+      await client.query(rollback);
+    } catch (error) {
+      discard = true;
+      throw error;
+    } finally {
+      client.release(discard);
+    }
+  }
 }
 
-function calculateProductHealth(rows: Observation[]): ProductRow[] {
-  const byProduct = new Map<string, ProductAccumulator>();
+function accumulateProductHealth(
+  current: ProductAccumulator | undefined,
+  row: Observation
+): ProductAccumulator {
+  current ??= {
+    productName: row.productName,
+    skuId: row.skuId,
+    country: row.country,
+    channel: row.channel,
+    shopName: row.shopName,
+    brandName: row.brandName,
+    categoryL2: row.categoryL2,
+    categoryL3: row.categoryL3,
+    observations: 0,
+    inStockCount: 0,
+    priceTotal: 0,
+    competitorPriceTotal: 0,
+    ratingTotal: 0,
+    reviewCountMax: 0,
+    contentScoreTotal: 0,
+  };
+  current.observations += 1;
+  current.inStockCount += row.inStock ? 1 : 0;
+  current.priceTotal += row.price;
+  current.competitorPriceTotal += row.competitorMedianPrice;
+  current.ratingTotal += row.rating;
+  current.reviewCountMax = Math.max(current.reviewCountMax, row.reviewCount);
+  current.contentScoreTotal += row.contentScore;
+  return current;
+}
 
-  for (const row of rows) {
-    const key = `${row.skuId}:${row.channel}`;
-    const current =
-      byProduct.get(key) ??
-      ({
-        productName: row.productName,
-        skuId: row.skuId,
-        country: row.country,
-        channel: row.channel,
-        shopName: row.shopName,
-        brandName: row.brandName,
-        categoryL2: row.categoryL2,
-        categoryL3: row.categoryL3,
-        observations: 0,
-        inStockCount: 0,
-        priceTotal: 0,
-        competitorPriceTotal: 0,
-        ratingTotal: 0,
-        reviewCountMax: 0,
-        contentScoreTotal: 0,
-      } satisfies ProductAccumulator);
+function finalizeProductHealth(row: ProductAccumulator): ProductRow {
+  const inStockRate = round((row.inStockCount / row.observations) * 100, 1);
+  const averagePrice = round(row.priceTotal / row.observations, 2);
+  const priceIndex = round(
+    (row.priceTotal / Math.max(row.competitorPriceTotal, 1)) * 100,
+    1
+  );
+  const rating = round(row.ratingTotal / row.observations, 2);
+  const contentScore = round(row.contentScoreTotal / row.observations, 0);
 
-    current.observations += 1;
-    current.inStockCount += row.inStock ? 1 : 0;
-    current.priceTotal += row.price;
-    current.competitorPriceTotal += row.competitorMedianPrice;
-    current.ratingTotal += row.rating;
-    current.reviewCountMax = Math.max(current.reviewCountMax, row.reviewCount);
-    current.contentScoreTotal += row.contentScore;
-    byProduct.set(key, current);
-  }
-
-  return [...byProduct.values()].map((row) => {
-    const inStockRate = round((row.inStockCount / row.observations) * 100, 1);
-    const averagePrice = round(row.priceTotal / row.observations, 2);
-    const priceIndex = round(
-      (row.priceTotal / Math.max(row.competitorPriceTotal, 1)) * 100,
-      1
-    );
-    const rating = round(row.ratingTotal / row.observations, 2);
-    const contentScore = round(row.contentScoreTotal / row.observations, 0);
-
-    return addHealthScore({
-      productName: row.productName,
-      skuId: row.skuId,
-      country: row.country,
-      channel: row.channel,
-      shopName: row.shopName,
-      brandName: row.brandName,
-      categoryL2: row.categoryL2,
-      categoryL3: row.categoryL3,
-      observations: row.observations,
-      inStockRate,
-      averagePrice,
-      priceIndex,
-      rating,
-      reviewCount: row.reviewCountMax,
-      contentScore,
-    });
+  return addHealthScore({
+    productName: row.productName,
+    skuId: row.skuId,
+    country: row.country,
+    channel: row.channel,
+    shopName: row.shopName,
+    brandName: row.brandName,
+    categoryL2: row.categoryL2,
+    categoryL3: row.categoryL3,
+    observations: row.observations,
+    inStockRate,
+    averagePrice,
+    priceIndex,
+    rating,
+    reviewCount: row.reviewCountMax,
+    contentScore,
   });
 }
 
